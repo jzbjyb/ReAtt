@@ -1,7 +1,7 @@
 # <ins>Re</ins>trieval as <ins>Att</ins>ention (ReAtt)
 
 This repository contains the code, models, and data for the paper
-[Retrieval as Attention: End-to-end Learning of Retrieval and Reading within a Single Transformer](https://arxiv.org/pdf/2212.02027.pdf) by Zhengbao Jiang*, Luyu Gao*, Jun Araki, Haibo Ding, Zhiruo Wang, Graham Neubig.
+[Retrieval as Attention: End-to-end Learning of Retrieval and Reading within a Single Transformer](https://arxiv.org/pdf/2212.02027.pdf) by Zhengbao Jiang*, Luyu Gao*, Jun Araki, Haibo Ding, Zhiruo Wang, Jamie Callan, Graham Neubig.
 
 ## Overview
 
