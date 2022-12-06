@@ -10,7 +10,7 @@ from reatt.data import Dataset
 
 
 
-def query(
+def retrieve(
     args: argparse.Namespace,
     model: ReAttForConditionalGeneration,
     tokenizer: AutoTokenizer,
@@ -30,8 +30,8 @@ def query(
             batch_queries,
             max_length=args.max_query_len,
             padding=True,
-            return_tensors='pt',
-            truncation=True)
+            truncation=True,
+            return_tensors='pt')
         encoded = {k: v.cuda() for k, v in encoded.items()}
         ranks: List[List[Tuple[str, float]]] = retriever.retrieve(**encoded)
         assert len(ranks) == len(batch_qids)
@@ -52,10 +52,10 @@ def index(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--task', type=str, default='retrieve', choices=['retrieve', 'index'], help='whether to query the index or build index')
     parser.add_argument('--model', type=str, default='neulab/reatt-large-nq-fiqa', help='model to load')
-    parser.add_argument('--retireval_corpus', type=str, default='reatt_download/reatt-large-nq-fiqa/retrieval', help='directory of retrieval corpus')
-    parser.add_argument('--task', type=str, default='query', choices=['query', 'index'], help='whether to query the index or build index')
-    parser.add_argument('--dataset', type=str, default=None, help='beir data containing docs and queries')
+    parser.add_argument('--retireval_corpus', type=str, default='reatt_download/reatt-large-nq-fiqa/fiqa', help='directory of retrieval corpus')
+    parser.add_argument('--dataset', type=str, default='reatt_download/fiqa', help='beir data containing docs, queries, and annotations')
     parser.add_argument('--split', type=str, default='test', help='split of the dataset to evaluate on')
     parser.add_argument('--output', type=str, default=None, help='output file')
 
@@ -68,8 +68,8 @@ if __name__ == '__main__':
     config = ReAttConfig.from_pretrained(args.model, retrieval_corpus=args.retireval_corpus)
     model = ReAttForConditionalGeneration.from_pretrained(args.model, config=config, cache_dir=None).cuda()
 
-    if args.task == 'query':
-        query(args, model, tokenizer)
+    if args.task == 'retrieve':
+        retrieve(args, model, tokenizer)
     elif args.task == 'index':
         index(args, model, tokenizer)
     else:
