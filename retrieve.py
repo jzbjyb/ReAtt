@@ -1,7 +1,10 @@
 from typing import List, Tuple, Dict
 import argparse
+import os
 import logging
 from tqdm import tqdm
+import numpy as np
+import torch
 from transformers import AutoTokenizer
 from beir.datasets.data_loader import GenericDataLoader
 from beir.retrieval.evaluation import EvaluateRetrieval
@@ -9,13 +12,71 @@ from reatt.model import ReAttConfig, ReAttForConditionalGeneration
 from reatt.data import Dataset
 
 
+class EmbeddingSaver:
+    def __init__(
+        self,
+        output_dir: str,
+        shard_id: int = 0,
+        save_every_docs: int = 100000,
+    ):
+        self.output_dir = output_dir
+        assert self.output_dir, 'requires output_dir'
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.shard_id = shard_id
+        self.save_every_docs = save_every_docs
+        self._init_results()
+        self.save_count = 0
 
-def retrieve(
-    args: argparse.Namespace,
-    model: ReAttForConditionalGeneration,
-    tokenizer: AutoTokenizer,
-):
+    def __len__(self):
+        return len(self.results['ids'])
+
+    def _init_results(self):
+        self.results: Dict[str, List] = {
+            'ids': [],
+            'embeddings': [],
+            'tokens': []
+        }
+        self.num_docs = 0
+
+    def save(self, flush: bool = False):
+        to_save = (flush and len(self)) or (self.save_every_docs and self.num_docs >= self.save_every_docs)
+        if not to_save:
+            return
+        self.results['ids'] = np.array(self.results['ids'], dtype=str)
+        self.results['tokens'] = torch.cat(self.results['tokens'], dim=0).numpy()
+        self.results['embeddings'] = torch.cat(self.results['embeddings'], dim=0).numpy()
+        out_file = os.path.join(self.output_dir, f'embedding_{self.shard_id:02d}_{self.save_count:03d}.npz')
+        logging.info(f'saving {len(self)} embeddings to {out_file}')
+        with open(out_file, mode='wb') as f:
+            np.savez_compressed(f, **self.results)
+        self._init_results()
+        self.save_count += 1
+
+    def add_by_flatten(
+        self,
+        input_ids: torch.LongTensor,  # (bs, seq_len)
+        attention_mask: torch.FloatTensor,  # (bs, seq_len)
+        embeddings: torch.FloatTensor,  # (bs, seq_len, emb_size_per_head)
+        ids: List[str],  # (bs,)
+    ):
+        self.num_docs += input_ids.size(0)
+        bs, seq_len, emb_size_ph = embeddings.size()
+        attention_mask = attention_mask.bool()
+        self.results['embeddings'].append(torch.masked_select(embeddings, attention_mask.unsqueeze(-1)).view(-1, emb_size_ph).cpu())
+        self.results['tokens'].append(torch.masked_select(input_ids, attention_mask).cpu())
+        for i in range(bs):
+            num_toks = attention_mask[i].sum().item()
+            for _ in range(num_toks):
+                self.results['ids'].append(ids[i])
+
+
+def retrieve(args: argparse.Namespace):
+    # load model
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    config = ReAttConfig.from_pretrained(args.model, retrieval_corpus=args.retireval_corpus)
+    model = ReAttForConditionalGeneration.from_pretrained(args.model, config=config, cache_dir=None).cuda()
     retriever = model.retriever
+
     # load beir data
     corpus, queries, qrels = GenericDataLoader(data_folder=args.dataset).load(split=args.split)
     qid2query: List[Tuple[str, str]] = list(queries.items())
@@ -42,12 +103,39 @@ def retrieve(
     EvaluateRetrieval.evaluate(qrels, qid2doc2score, [1, 5, 10])
 
 
-def index(
-    args: argparse.Namespace,
-    model: ReAttForConditionalGeneration,
-    tokenizer: AutoTokenizer,
-):
-    raise NotImplementedError
+def index(args: argparse.Namespace):
+    # load model
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    config = ReAttConfig.from_pretrained(args.model)
+    model = ReAttForConditionalGeneration.from_pretrained(args.model, config=config, cache_dir=None).cuda()
+    retriever = model.retriever
+    saver = EmbeddingSaver(output_dir=args.output)
+
+    # load beir data
+    corpus = GenericDataLoader(data_folder=args.dataset).load(split=args.split)[0]
+    corpus = list(corpus.items())
+    logging.info(f'#docs {len(corpus)}')
+
+    # encode docs and save
+    for start in tqdm(range(0, len(corpus), args.batch_size)):
+        batch_dids, batch_docs = list(zip(*corpus[start:start + args.batch_size]))
+        batch_docs: List[str] = [Dataset.get_context(title=doc['title'], text=doc['text']) for doc in batch_docs]
+        encoded = tokenizer.batch_encode_plus(
+            batch_docs,
+            max_length=args.max_context_len,
+            padding=True,
+            truncation=True,
+            return_tensors='pt')
+        encoded = {k: v.cuda() for k, v in encoded.items()}
+        embeddings = retriever.encode_documents(**encoded)
+        saver.add_by_flatten(
+            input_ids=encoded['input_ids'],
+            attention_mask=encoded['attention_mask'],
+            embeddings=embeddings,
+            ids=batch_dids,
+        )
+        saver.save()
+    saver.save(flush=True)
 
 
 if __name__ == '__main__':
@@ -61,16 +149,14 @@ if __name__ == '__main__':
 
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--max_query_len', type=int, default=128)
+    parser.add_argument('--max_context_len', type=int, default=512)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    config = ReAttConfig.from_pretrained(args.model, retrieval_corpus=args.retireval_corpus)
-    model = ReAttForConditionalGeneration.from_pretrained(args.model, config=config, cache_dir=None).cuda()
 
     if args.task == 'retrieve':
-        retrieve(args, model, tokenizer)
+        retrieve(args)
     elif args.task == 'index':
-        index(args, model, tokenizer)
+        index(args)
     else:
         raise NotImplementedError

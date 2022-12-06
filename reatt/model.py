@@ -194,7 +194,7 @@ class ReAttAttention(T5Attention):
                 else:
                     outputs = outputs + (
                         (query_states[:, self.retrieval_head].contiguous(),
-                        value_states[:, self.retrieval_head].contiguous(),
+                        key_states[:, self.retrieval_head].contiguous(),
                         value_states[:, self.retrieval_head].contiguous()),)
         return outputs
 
@@ -973,11 +973,12 @@ class ReAttRetriever:
 
     def load_index(self):
         emb_files = glob.glob(f'{self.retrieval_corpus}/embedding_*.npz')
-        assert len(emb_files), f"didn't find embedding files in {self.retrieval_corpus}"
-        self.index = Index(
-            emb_files,
-            vector_dimension=self.vector_dimension,
-            gpu_ids=self.gpu_id)
+        self.index = None
+        if len(emb_files):
+            self.index = Index(
+                emb_files,
+                vector_dimension=self.vector_dimension,
+                gpu_ids=self.gpu_id)
 
     def load_data(self):
         pass
@@ -996,6 +997,14 @@ class ReAttRetriever:
         query_states, key_states, value_states = output.attentions[self.retrieval_layer]
         return query_states, key_states, value_states
 
+    def encode_queries(self, *args, **kwargs):
+        with torch.no_grad():
+            return self.encode(*args, **kwargs)[0]
+
+    def encode_documents(self, *args, **kwargs):
+        with torch.no_grad():
+            return self.encode(*args, **kwargs)[1]
+
     def retrieve(
         self,
         input_ids: torch.LongTensor,  # (bs, seq_len)
@@ -1004,8 +1013,7 @@ class ReAttRetriever:
     ):
         attention_mask = torch.ones_like(input_ids) if attention_mask is None else attention_mask
         # (bs, seq_len, vector_dimension)
-        with torch.no_grad():
-            query_embedding = self.encode(input_ids, attention_mask=attention_mask)[0]
+        query_embedding = self.encode_queries(input_ids, attention_mask=attention_mask)
         query_embedding = torch.masked_select(
             query_embedding, attention_mask.eq(1).unsqueeze(-1)).view(-1, self.vector_dimension) # (num_tokens_flat, vector_dimension)
         query_lens = attention_mask.sum(-1)  # (bs)

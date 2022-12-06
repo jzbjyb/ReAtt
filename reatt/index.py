@@ -82,7 +82,7 @@ class Index:
         for emb_file in tqdm(self.emb_files):
             with open(emb_file, 'rb') as fin:
                 npzfile = np.load(fin)
-                _ids, _embs, _texts = npzfile['ids'], npzfile['embeddings'], npzfile['words']
+                _ids, _embs, _texts = npzfile['ids'], npzfile['embeddings'], npzfile['tokens']
                 ids.append(_ids)
                 embs.append(_embs)
                 texts.append(_texts)

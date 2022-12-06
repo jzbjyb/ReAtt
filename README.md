@@ -56,14 +56,25 @@ print(corpus[rank[0][0]]['text'], rank[0][1], sep='\n')  # content of the top-1 
 ## Experiments
 
 ### Retrieval inference
+Save embeddings of all document tokens from `dataset` using `model`.
+```shell
+python retrieve.py \
+  --task index \
+  --model neulab/reatt-large-nq-fiqa \
+  --dataset reatt_download/fiqa \
+  --output output/fiqa \
+  --max_context_len 512
+```
+
+Load `model` and embeddings from `retireval_corpus`, retrieve top-100 documents for queries from the `dataset`, and compute retrieval metrics (nDCG, MAP, recall precision).
 ```shell
 python retrieve.py \
   --task retrieve \
   --model neulab/reatt-large-nq-fiqa \
   --retireval_corpus reatt_download/reatt-large-nq-fiqa/fiqa \
   --dataset reatt_download/fiqa \
+  --max_query_len 128
 ```
-This will load `model` and embeddings from `retireval_corpus`, retrieve top-100 documents for queries from the `dataset`, and compute retrieval metrics (nDCG, MAP, recall precision).
 
 ## Reference
 
