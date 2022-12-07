@@ -54,7 +54,7 @@ print(corpus[rank[0][0]]['text'], rank[0][1], sep='\n')  # content of the top-1 
 # Food is almost never a valid expense. Reason for it is simple - if you were not conducting business you would have to eat too. ...
 # 224.07415771484375
 
-# === retrieve then generation ===
+# === retrieve then generate ===
 prediction = model.generate(**encoded, search_kwargs={'doc_topk': 10, 'max_length': 512}, max_length=512)[0]
 print(tokenizer.decode(prediction, skip_special_tokens=True))
 # "It depends on what the ""true"" reason for the trip is. If you decide to deduct the trip as a business expense ...
