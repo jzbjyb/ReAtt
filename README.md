@@ -86,7 +86,7 @@ python inference.py \
 
 ## Inference: retrieval-augmented generation
 
-Load `model` and embeddings from `retireval_corpus`, retrieve top-100 documents for queries from the `dataset`, and generate answers.
+Load `model` and embeddings from `retireval_corpus`, retrieve top-10 documents for queries from the `dataset`, and generate answers.
 ```shell
 python inference.py \
   --task generate \
