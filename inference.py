@@ -74,8 +74,8 @@ def retrieve(args: argparse.Namespace):
     # load model
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     config = ReAttConfig.from_pretrained(args.model, retrieval_corpus=args.retireval_corpus)
-    model = ReAttForConditionalGeneration.from_pretrained(args.model, config=config, cache_dir=None).cuda()
-    retriever = model.retriever
+    model = ReAttForConditionalGeneration.from_pretrained(args.model, config=config).cuda()
+    retriever = model.encoder.retriever
 
     # load beir data
     corpus, queries, qrels = GenericDataLoader(data_folder=args.dataset).load(split=args.split)
@@ -94,7 +94,9 @@ def retrieve(args: argparse.Namespace):
             truncation=True,
             return_tensors='pt')
         encoded = {k: v.cuda() for k, v in encoded.items()}
-        ranks: List[List[Tuple[str, float]]] = retriever.retrieve(**encoded)
+        ranks: List[List[Tuple[str, float]]] = retriever.retrieve(
+            **encoded,
+            search_kwargs={'doc_topk': args.doc_topk})
         assert len(ranks) == len(batch_qids)
         for qid, rank in zip(batch_qids, ranks):
             qid2doc2score[qid] = dict(rank)
@@ -107,8 +109,8 @@ def index(args: argparse.Namespace):
     # load model
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     config = ReAttConfig.from_pretrained(args.model)
-    model = ReAttForConditionalGeneration.from_pretrained(args.model, config=config, cache_dir=None).cuda()
-    retriever = model.retriever
+    model = ReAttForConditionalGeneration.from_pretrained(args.model, config=config).cuda()
+    retriever = model.encoder.retriever
     saver = EmbeddingSaver(output_dir=args.output)
 
     # load beir data
@@ -138,9 +140,45 @@ def index(args: argparse.Namespace):
     saver.save(flush=True)
 
 
+def generate(args: argparse.Namespace):
+    # load model
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    config = ReAttConfig.from_pretrained(args.model, retrieval_corpus=args.retireval_corpus)
+    model = ReAttForConditionalGeneration.from_pretrained(args.model, config=config).cuda()
+
+    # load beir data
+    corpus, queries, qrels = GenericDataLoader(data_folder=args.dataset).load(split=args.split)
+    qid2query: List[Tuple[str, str]] = list(queries.items())
+    logging.info(f'#quereis {len(qid2query)}')
+
+    # query
+    predictions: List[str] = []
+    for start in tqdm(range(0, len(qid2query), args.batch_size)):
+        batch_qids, batch_queries = list(zip(*qid2query[start:start + args.batch_size]))
+        batch_queries = [Dataset.get_question(q) for q in batch_queries]
+        encoded = tokenizer.batch_encode_plus(
+            batch_queries,
+            max_length=args.max_query_len,
+            padding=True,
+            truncation=True,
+            return_tensors='pt')
+        encoded = {k: v.cuda() for k, v in encoded.items()}
+        output = model.generate(
+            **encoded,
+            search_kwargs={'doc_topk': args.doc_topk, 'max_length': args.max_context_len},
+            max_length=args.max_generation_len)
+        predictions.extend(tokenizer.batch_decode(output, skip_special_tokens=True))
+
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    with open(args.output, 'w') as fout:
+        for prediction in predictions:
+            prediction = prediction.replace('\n', ' ')
+            fout.write(prediction + '\n')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--task', type=str, default='retrieve', choices=['retrieve', 'index'], help='whether to query the index or build index')
+    parser.add_argument('--task', type=str, default='retrieve', choices=['retrieve', 'index', 'generate'], help='whether to query the index or build index')
     parser.add_argument('--model', type=str, default='neulab/reatt-large-nq-fiqa', help='model to load')
     parser.add_argument('--retireval_corpus', type=str, default='reatt_download/reatt-large-nq-fiqa/fiqa', help='directory of retrieval corpus')
     parser.add_argument('--dataset', type=str, default='reatt_download/fiqa', help='beir data containing docs, queries, and annotations')
@@ -148,8 +186,10 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=str, default=None, help='output file')
 
     parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--doc_topk', type=int, default=10)
     parser.add_argument('--max_query_len', type=int, default=128)
     parser.add_argument('--max_context_len', type=int, default=512)
+    parser.add_argument('--max_generation_len', type=int, default=512)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -158,5 +198,7 @@ if __name__ == '__main__':
         retrieve(args)
     elif args.task == 'index':
         index(args)
+    elif args.task == 'generate':
+        generate(args)
     else:
         raise NotImplementedError

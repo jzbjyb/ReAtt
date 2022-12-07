@@ -16,32 +16,34 @@
 
 
 import copy
-import math
-import os
 import glob
 import warnings
-from typing import Optional, Tuple, Union, Dict, Any
+import os
+import json
+from dataclasses import dataclass
+from collections import OrderedDict
+from typing import Tuple, Dict, Any, List
 
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.utils.checkpoint import checkpoint
 
-from transformers.activations import ACT2FN
+from transformers import AutoTokenizer
 from transformers.modeling_outputs import (
     BaseModelOutput,
     BaseModelOutputWithPastAndCrossAttentions,
     Seq2SeqLMOutput,
-    Seq2SeqModelOutput,
 )
-from transformers.modeling_utils import find_pruneable_heads_and_indices, prune_linear_layer
 from transformers.file_utils import add_start_docstrings, add_start_docstrings_to_model_forward, replace_return_docstrings
 from transformers.utils import logging
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
 from transformers import T5Config
-from transformers.models.t5.modeling_t5 import T5Attention, PARALLELIZE_DOCSTRING, DEPARALLELIZE_DOCSTRING, _CONFIG_FOR_DOC, _TOKENIZER_FOR_DOC, _CHECKPOINT_FOR_DOC, T5_PRETRAINED_MODEL_ARCHIVE_LIST, \
-    T5LayerNorm, T5LayerFF, T5PreTrainedModel, T5_START_DOCSTRING, T5_INPUTS_DOCSTRING, __HEAD_MASK_WARNING_MSG
+from transformers.models.t5.modeling_t5 import T5Attention, T5LayerNorm, T5LayerFF, T5PreTrainedModel, \
+    PARALLELIZE_DOCSTRING, DEPARALLELIZE_DOCSTRING, _CONFIG_FOR_DOC, T5_INPUTS_DOCSTRING, __HEAD_MASK_WARNING_MSG
 from reatt.index import Index
+from reatt.data import Dataset, Collator
+
 
 logger = logging.get_logger(__name__)
 
@@ -71,7 +73,9 @@ class ReAttAttention(T5Attention):
         layer_index: int = None
     ):
         super().__init__(config, has_relative_attention_bias=has_relative_attention_bias)
-        self.run_retrieval = layer_index == config.retrieval_layer
+        self.layer_index = layer_index
+        self.run_retrieval = not config.is_decoder and layer_index == config.retrieval_layer
+        self.full_attention = not config.is_decoder and layer_index >= config.retrieval_layer
         self.retrieval_head = config.retrieval_head
 
     def forward(
@@ -149,6 +153,7 @@ class ReAttAttention(T5Attention):
             query_states, key_states.transpose(3, 2)
         )  # equivalent of torch.einsum("bnqd,bnkd->bnqk", query_states, key_states), compatible with onnx op>9
 
+        position_bias = None  # never use cached position_bias from previous layers
         if position_bias is None:
             if not self.has_relative_attention_bias:
                 position_bias = torch.zeros(
@@ -165,6 +170,8 @@ class ReAttAttention(T5Attention):
                 position_bias = position_bias[:, :, -hidden_states.size(1) :, :]
 
             if mask is not None:
+                if self.full_attention:
+                    mask = mask.max(2, keepdim=True).values
                 position_bias = position_bias + mask  # (batch_size, n_heads, seq_length, key_length)
 
         scores += position_bias
@@ -288,7 +295,6 @@ class ReAttBlock(nn.Module):
             layer_index=layer_index))
         if self.is_decoder:
             self.layer.append(T5LayerCrossAttention(config))
-
         self.layer.append(T5LayerFF(config))
 
     def forward(
@@ -396,6 +402,13 @@ class ReAttPreTrainedModel(T5PreTrainedModel):
     config_class = ReAttConfig
 
 
+@dataclass
+class BaseModelOutputWithPastAndCrossAttentionsRetrieval(BaseModelOutputWithPastAndCrossAttentions):
+    input_ids: torch.LongTensor = None
+    attention_mask: torch.FloatTensor = None
+    ranks: List[List[Tuple[str, float]]] = None
+
+
 class ReAttStack(T5PreTrainedModel):
     def __init__(self, config: ReAttConfig, embed_tokens=None):
         super().__init__(config)
@@ -404,8 +417,8 @@ class ReAttStack(T5PreTrainedModel):
         self.is_decoder = config.is_decoder
 
         self.block = nn.ModuleList(
-            [ReAttBlock(config, has_relative_attention_bias=bool(i == 0), layer_index=i) for i in range(config.num_layers)]
-        )
+            [ReAttBlock(config, has_relative_attention_bias=True, layer_index=i) for i in range(config.num_layers)]
+        )  # compute relative attention bias in all layers
         self.final_layer_norm = T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
         self.dropout = nn.Dropout(config.dropout_rate)
 
@@ -417,6 +430,15 @@ class ReAttStack(T5PreTrainedModel):
         self.gradient_checkpointing = False
 
         self.retrieval_layer = config.retrieval_layer
+        self.retriever = ReAttRetriever(self) if not self.is_decoder else None
+
+    def _copy_relative_attention_bias(self):
+        if hasattr(self, '_copied') and self._copied:
+            return
+        rab = self.block[0].layer[0].SelfAttention.relative_attention_bias
+        for block in self.block:
+            block.layer[0].SelfAttention.relative_attention_bias = rab
+        self._copied = True
 
     @add_start_docstrings(PARALLELIZE_DOCSTRING)
     def parallelize(self, device_map=None):
@@ -472,7 +494,24 @@ class ReAttStack(T5PreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
         only_biencoder: bool = False,
+        search_kwargs: Dict[str, Any] = {}
     ):
+        self._copy_relative_attention_bias()
+
+        has_ctx = input_ids.dim() == 3
+        run_retrieval = not has_ctx and not self.is_decoder and not only_biencoder
+        if run_retrieval:  # retrieval
+            ranks, input_ids, attention_mask = self.retriever.retrieve_and_prepare(
+                input_ids, attention_mask, search_kwargs=search_kwargs)
+            has_ctx = True
+
+        if has_ctx:
+            # encode each ctx independently
+            assert attention_mask is not None and attention_mask.dim() == 4, 'attention_mask has incorrect shape'
+            num_ctxs, seq_len = input_ids.shape[-2:]
+            input_ids = input_ids.view(-1, seq_len)  # (bs * num_ctxs, seq_len)
+            attention_mask = attention_mask.view(-1, seq_len, seq_len)  # (bs * num_ctxs, seq_len, seq_len)
+
         # Model parallel
         if self.model_parallel:
             torch.cuda.set_device(self.first_device)
@@ -652,6 +691,27 @@ class ReAttStack(T5PreTrainedModel):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
+        if has_ctx:  # convert back to the original shape
+            def nested_split_first(x):
+                if type(x) is list:
+                    return [nested_split_first(_x) for _x in x]
+                if type(x) is tuple:
+                    return tuple(nested_split_first(_x) for _x in x)
+                return x.view(-1, num_ctxs, *x.shape[1:])
+            hidden_states = nested_split_first(hidden_states)
+            input_ids = nested_split_first(input_ids)
+            attention_mask = nested_split_first(attention_mask)
+            if present_key_value_states is not None:
+                present_key_value_states = nested_split_first(present_key_value_states)
+            if all_hidden_states is not None:
+                all_hidden_states = nested_split_first(all_hidden_states)
+            if all_attentions is not None:
+                all_attentions = nested_split_first(all_attentions)
+            if all_cross_attentions is not None:
+                all_cross_attentions = nested_split_first(all_cross_attentions)
+
+        ranks = ranks if run_retrieval else 'no_retrieval'
+
         if not return_dict:
             return tuple(
                 v
@@ -661,15 +721,21 @@ class ReAttStack(T5PreTrainedModel):
                     all_hidden_states,
                     all_attentions,
                     all_cross_attentions,
+                    input_ids,
+                    attention_mask,
+                    ranks,
                 ]
                 if v is not None
             )
-        return BaseModelOutputWithPastAndCrossAttentions(
+        return BaseModelOutputWithPastAndCrossAttentionsRetrieval(
             last_hidden_state=hidden_states,
             past_key_values=present_key_value_states,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
             cross_attentions=all_cross_attentions,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            ranks=ranks
         )
 
 class ReAttForConditionalGeneration(ReAttPreTrainedModel):
@@ -693,7 +759,6 @@ class ReAttForConditionalGeneration(ReAttPreTrainedModel):
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
         self.encoder = ReAttStack(encoder_config, self.shared)
-        self.retriever = ReAttRetriever(self.encoder)
 
         decoder_config = copy.deepcopy(config)
         decoder_config.is_decoder = True
@@ -758,8 +823,8 @@ class ReAttForConditionalGeneration(ReAttPreTrainedModel):
     @replace_return_docstrings(output_type=Seq2SeqLMOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
-        input_ids=None,  # (bs, seq_len) or (bs, n_docs, seq_len)
-        attention_mask=None,
+        input_ids=None,  # (bs, seq_len) or (bs, num_ctxs, seq_len)
+        attention_mask=None,  # (bs, seq_len) or (bs, num_ctxs, seq_len, seq_len)
         decoder_input_ids=None,
         decoder_attention_mask=None,
         head_mask=None,
@@ -774,6 +839,7 @@ class ReAttForConditionalGeneration(ReAttPreTrainedModel):
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
+        search_kwargs: Dict[str, Any] = {},
     ):
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -797,12 +863,6 @@ class ReAttForConditionalGeneration(ReAttPreTrainedModel):
         >>> print(tokenizer.decode(outputs[0], skip_special_tokens=True))
         >>> # studies have shown that owning a dog is good for you.
         ```"""
-
-        has_docs = input_ids.dim() == 3
-        if not has_docs:  # retrieve
-            self.retriever.retrieve(input_ids, attention_mask)
-
-
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -822,16 +882,29 @@ class ReAttForConditionalGeneration(ReAttPreTrainedModel):
                 head_mask=head_mask,
                 output_attentions=True,  # always output attention for retrieval
                 output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
+                return_dict=True,  # dict is more convenient
+                search_kwargs=search_kwargs,
             )
-        elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
+        elif return_dict and not isinstance(encoder_outputs, OrderedDict):  # TODO: corner case?
             encoder_outputs = BaseModelOutput(
                 last_hidden_state=encoder_outputs[0],
                 hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
                 attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
             )
 
-        hidden_states = encoder_outputs[0]
+        hidden_states = encoder_outputs[0]  # (bs, seq_len, emb_size) or (bs, num_ctxs, seq_len, emb_size)
+        has_ctx = hidden_states.dim() == 4
+        runned_retrieval = type(encoder_outputs[-1]) is not str
+        retrieved = has_ctx and runned_retrieval
+        if has_ctx:  # prepare for fusion-in-decoder
+            if retrieved:  # encoder performs retrieval
+                input_ids, attention_mask, ranks = encoder_outputs[-3:]
+            bs, num_ctxs, seq_len = hidden_states.shape[:3]
+            # (bs, num_ctxs * seq_len, emb_size)
+            hidden_states = hidden_states.view(bs, num_ctxs * seq_len, *hidden_states.shape[3:])
+            assert attention_mask.dim() == 4, 'attention_mask has incorrect shape'
+            attention_mask = attention_mask.max(2).values  # (bs, num_ctxs, seq_len)
+            attention_mask = attention_mask.view(bs, -1)  # (bs, num_ctxs * seq_len)
 
         if self.model_parallel:
             torch.cuda.set_device(self.decoder.first_device)
@@ -961,6 +1034,15 @@ class ReAttForConditionalGeneration(ReAttPreTrainedModel):
 
 
 class ReAttRetriever:
+    default_search_kwargs: Dict[str, Any] = {
+        'token_topk': 2048,  # the number of tokens to retrieve for each query token
+        'rerank_topk': 2048,  # the number of docs to rerank using full doc-query matrix
+        'doc_topk': 100,  # the final number of docs to return
+        'batch_size': 1024,
+        'max_length': 512,
+        'tokenizer': AutoTokenizer.from_pretrained('google/t5-large-lm-adapt'),
+    }
+
     def __init__(self, encoder: ReAttStack):
         self.encoder = encoder
         config = encoder.config
@@ -970,18 +1052,38 @@ class ReAttRetriever:
         self.gpu_id = 0  # TODO: index device
         self.device = torch.device(f'cuda:{self.gpu_id}')
         self.load_index()
+        self.load_data()
+
+    def get_search_kwargs(self, search_kwargs: Dict[str, Any] = {}):
+        skwargs = copy.deepcopy(self.default_search_kwargs)
+        skwargs.update(search_kwargs)
+        return skwargs
 
     def load_index(self):
         emb_files = glob.glob(f'{self.retrieval_corpus}/embedding_*.npz')
         self.index = None
-        if len(emb_files):
-            self.index = Index(
-                emb_files,
-                vector_dimension=self.vector_dimension,
-                gpu_ids=self.gpu_id)
+        if len(emb_files) <= 0:
+            logging.warning(f'did not find embedding in {self.retrieval_corpus}')
+            return
+        self.index = Index(
+            emb_files,
+            vector_dimension=self.vector_dimension,
+            gpu_ids=self.gpu_id)
 
     def load_data(self):
-        pass
+        corpus_file = os.path.join(self.retrieval_corpus, 'corpus.jsonl')
+        self.id2doc: Dict[str, Dict[str, str]] = {}
+        if not os.path.exists(corpus_file):
+            logging.warning(f'did not find corpus in {corpus_file}')
+            return
+        with open(corpus_file, 'r') as fin:
+            for l in fin:
+                doc = json.loads(l)
+                self.id2doc[doc['_id']] = doc
+
+    def get_context(self, did: str):
+        doc = self.id2doc[did]
+        return Dataset.get_context(title=doc['title'], text=doc['text'])
 
     def encode(
         self,
@@ -1011,15 +1113,39 @@ class ReAttRetriever:
         attention_mask: torch.LongTensor = None, # (bs, seq_len)
         search_kwargs: Dict[str, Any] = {}
     ):
+        # encode queries
         attention_mask = torch.ones_like(input_ids) if attention_mask is None else attention_mask
         # (bs, seq_len, vector_dimension)
         query_embedding = self.encode_queries(input_ids, attention_mask=attention_mask)
         query_embedding = torch.masked_select(
             query_embedding, attention_mask.eq(1).unsqueeze(-1)).view(-1, self.vector_dimension) # (num_tokens_flat, vector_dimension)
         query_lens = attention_mask.sum(-1)  # (bs)
+
+        # search index
         ranks = self.index.search(
           query_embedding.to(self.device),
           query_lens=query_lens.to(self.device),
-          **search_kwargs)
-
+          **self.get_search_kwargs(search_kwargs))
         return ranks
+
+    def retrieve_and_prepare(
+        self,
+        input_ids: torch.LongTensor,  # (bs, seq_len)
+        attention_mask: torch.LongTensor = None, # (bs, seq_len)
+        search_kwargs: Dict[str, Any] = {},
+    ):
+        device = input_ids.device
+        kw = self.get_search_kwargs(search_kwargs)
+        tokenizer = kw['tokenizer']
+        max_length = kw['max_length']
+
+        # retrieve
+        ranks = self.retrieve(input_ids, attention_mask, search_kwargs=search_kwargs)
+
+        # prepare
+        questions = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+        contexts = [[self.get_context(did) for did, _ in rank] for rank in ranks]
+        input_ids, attention_mask = Collator.prepare_question_context(
+            questions, contexts, tokenizer=tokenizer, max_length=max_length)
+
+        return ranks, input_ids.to(device), attention_mask.to(device)

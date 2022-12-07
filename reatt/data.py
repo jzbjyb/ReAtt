@@ -1,6 +1,8 @@
 from typing import List, Dict, Union
 import random
+import numpy as np
 import torch
+from transformers import AutoTokenizer
 
 
 class Dataset(torch.utils.data.Dataset):
@@ -71,3 +73,80 @@ class Dataset(torch.utils.data.Dataset):
             return
         for ex in self.data:
             ex['ctxs'].sort(key=lambda x: float(x['score']), reverse=True)
+
+
+class Collator:
+    def __init__(
+        self,
+        tokenizer: AutoTokenizer,
+        max_len: int = None,
+        answer_max_len: int = None,
+    ):
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.answer_max_len = answer_max_len
+
+    @classmethod
+    def prepare_question_context(
+        cls,
+        questions: List[str],
+        contexts: List[List[str]],
+        tokenizer: AutoTokenizer,
+        max_length: int,
+    ):
+        assert len(questions) == len(contexts)
+        pad_token_id = tokenizer.pad_token_id
+
+        input_ids = []  # (bs, num_ctxs, seq_len)
+        attention_mask = []  # (bs, num_ctxs, seq_len, seq_len)
+        for q_idx in range(len(questions)):
+            input_ids.append([])
+            attention_mask.append([])
+
+            # tokenizer questions
+            # at least include one token from passage in addition to bos and eos
+            question = questions[q_idx]
+            qids: List[int] = tokenizer.encode(question, add_special_tokens=False)[:max_length - 3]
+
+            # tokenize contexts and concatenate with questions
+            for ctx in contexts[q_idx]:
+                cids: List[int] = tokenizer.encode(ctx, add_special_tokens=True, max_length=max_length - len(qids))
+                qcids = qids + cids + [pad_token_id] * (max_length - len(qids) - len(cids))
+                attn_mask = np.zeros((max_length, max_length))
+                attn_mask[:len(qids), :len(qids)] = 1.0  # questions only see questions
+                attn_mask[len(qids):, len(qids):len(qids) + len(cids)] = 1.0  # ctxs only see ctxs
+                input_ids[-1].append(qcids)
+                attention_mask[-1].append(attn_mask)
+
+        input_ids = torch.tensor(input_ids)
+        attention_mask = torch.tensor(np.array(attention_mask)).float()
+        return input_ids, attention_mask
+
+    def __call__(self, batch):
+        index = torch.tensor([ex['index'] for ex in batch])
+
+        # decoder
+        target = [ex['answer'] for ex in batch]
+        target = self.tokenizer.batch_encode_plus(
+            target,
+            max_length=self.answer_max_len,
+            padding=True,
+            truncation=True,
+            return_tensors='pt')
+        labels = target['input_ids']
+        labels = labels.masked_fill(~target['attention_mask'].bool(), -100)
+
+        # encoder
+        questions = [ex['question'] for ex in batch]
+        contexts = [ex['ctxs_text'] for ex in batch]
+        ctxs_id = np.array([ex['ctxs_id'] for ex in batch], dtype=str)
+        input_ids, attention_mask = self.prepare_question_context(
+            questions, contexts, tokenizer=self.tokenizer, max_length=self.max_len)
+
+        return {
+            'index': index,
+            'labels': labels,
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'ctxs_id': ctxs_id,
+        }

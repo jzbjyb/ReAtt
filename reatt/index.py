@@ -167,6 +167,7 @@ class Index:
         rerank_topk: int = 2048,  # the number of docs to rerank using full doc-query matrix
         doc_topk: int = 100,  # the final number of docs to return
         batch_size: int = 1024,  # batch_size for faiss search
+        **kwargs
     ) -> Dict[int, List[Tuple[str, float]]]:
         device = self.main_device
 
