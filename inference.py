@@ -11,6 +11,7 @@ from beir.retrieval.evaluation import EvaluateRetrieval
 from reatt.model import ReAttConfig, ReAttForConditionalGeneration
 from reatt.data import Dataset
 
+from passage_db import PassageDB
 
 class EmbeddingSaver:
     def __init__(
@@ -78,7 +79,7 @@ def retrieve(args: argparse.Namespace):
     retriever = model.encoder.retriever
 
     # load beir data
-    corpus, queries, qrels = GenericDataLoader(data_folder=args.dataset).load(split=args.split)
+    _, queries, qrels = GenericDataLoader(data_folder=args.dataset).load(split=args.split)
     qid2query: List[Tuple[str, str]] = list(queries.items())
     logging.info(f'#quereis {len(qid2query)}')
 
@@ -111,32 +112,60 @@ def index(args: argparse.Namespace):
     config = ReAttConfig.from_pretrained(args.model)
     model = ReAttForConditionalGeneration.from_pretrained(args.model, config=config).cuda()
     retriever = model.encoder.retriever
-    saver = EmbeddingSaver(output_dir=args.output)
+    saver = EmbeddingSaver(output_dir=args.embedding_output)
 
-    # load beir data
-    corpus = GenericDataLoader(data_folder=args.dataset).load(split=args.split)[0]
-    corpus = list(corpus.items())
-    logging.info(f'#docs {len(corpus)}')
+    if args.zero-shot == True:
+        # load beir data
+        corpus = GenericDataLoader(data_folder=args.dataset).load(split=args.split)[0]
+        corpus = list(corpus.items())
+        logging.info(f'#docs {len(corpus)}')
+        # encode docs and save
+        for start in tqdm(range(0, len(corpus), args.batch_size)):
+            batch_dids, batch_docs = list(zip(*corpus[start:start + args.batch_size]))
+            batch_docs: List[str] = [Dataset.get_context(title=doc['title'], text=doc['text']) for doc in batch_docs]
+            encoded = tokenizer.batch_encode_plus(
+                batch_docs,
+                max_length=args.max_context_len,
+                padding=True,
+                truncation=True,
+                return_tensors='pt')
+            encoded = {k: v.cuda() for k, v in encoded.items()}
+            embeddings = retriever.encode_documents(**encoded)
+            saver.add_by_flatten(
+                input_ids=encoded['input_ids'],
+                attention_mask=encoded['attention_mask'],
+                embeddings=embeddings,
+                ids=batch_dids,
+            )
+            saver.save()
 
-    # encode docs and save
-    for start in tqdm(range(0, len(corpus), args.batch_size)):
-        batch_dids, batch_docs = list(zip(*corpus[start:start + args.batch_size]))
-        batch_docs: List[str] = [Dataset.get_context(title=doc['title'], text=doc['text']) for doc in batch_docs]
-        encoded = tokenizer.batch_encode_plus(
-            batch_docs,
-            max_length=args.max_context_len,
-            padding=True,
-            truncation=True,
-            return_tensors='pt')
-        encoded = {k: v.cuda() for k, v in encoded.items()}
-        embeddings = retriever.encode_documents(**encoded)
-        saver.add_by_flatten(
-            input_ids=encoded['input_ids'],
-            attention_mask=encoded['attention_mask'],
-            embeddings=embeddings,
-            ids=batch_dids,
-        )
-        saver.save()
+    else: 
+        # Load Passage DB
+        db_file = os.path.join(args.retrieval_corpus, 'psgs_db')
+        passage_db = PassageDB(db_file)
+        db_iterator = iter(passage_db)
+
+        with tqdm(total=len(passage_db)) as pbar:
+            while True:
+                passages = list(itertools.islice(db_iterator, args.batch_size))
+                encoded = tokenizer.batch_encode_plus(
+                    [(passage.title, passage.text) for passage in passages],
+                    max_length=args.max_context_len,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt"
+                )
+                encoded = {k: v.cuda() for k, v in encoded.items()}
+                embeddings = retriever.encode_documents(**encoded)
+                saver.add_by_flatten(
+                    input_ids=encoded['input_ids'],
+                    attention_mask=encoded['attention_mask'],
+                    embeddings=embeddings,
+                    ids=batch_dids,
+                )
+                saver.save()
+                pbar.update(args.batch_size)
+                
     saver.save(flush=True)
 
 
@@ -147,7 +176,7 @@ def generate(args: argparse.Namespace):
     model = ReAttForConditionalGeneration.from_pretrained(args.model, config=config).cuda()
 
     # load beir data
-    corpus, queries, qrels = GenericDataLoader(data_folder=args.dataset).load(split=args.split)
+    _, queries, qrels = GenericDataLoader(data_folder=args.dataset).load(split=args.split)
     qid2query: List[Tuple[str, str]] = list(queries.items())
     logging.info(f'#quereis {len(qid2query)}')
 
@@ -179,11 +208,12 @@ def generate(args: argparse.Namespace):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', type=str, default='retrieve', choices=['retrieve', 'index', 'generate'], help='whether to query the index or build index')
-    parser.add_argument('--model', type=str, default='neulab/reatt-large-nq-fiqa', help='model to load')
-    parser.add_argument('--retireval_corpus', type=str, default='reatt_download/reatt-large-nq-fiqa/fiqa', help='directory of retrieval corpus')
-    parser.add_argument('--dataset', type=str, default='reatt_download/fiqa', help='beir data containing docs, queries, and annotations')
+    parser.add_argument('--model', type=str, default='neulab/reatt-large-nq', help='model to load')
+    parser.add_argument('--retrieval_corpus', type=str, default='reatt_download/nq', help='directory of retrieval corpus')
+    parser.add_argument('--dataset', type=str, default='reatt_download/nq/nq', help='Data containing docs, queries, and annotations')
     parser.add_argument('--split', type=str, default='test', help='split of the dataset to evaluate on')
-    parser.add_argument('--output', type=str, default=None, help='output file')
+    parser.add_argument('--embedding_output', type=str, default='reatt_download/nq', help='Passage embedding output file')
+    parser.add_argument('--zero-shot', type=bool, default=False, help='Whether the dataset is from BEIR (True) or not (False)')
 
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--doc_topk', type=int, default=10)
